@@ -1,14 +1,14 @@
 // =======================================================================
 // ===                    HORIMEKI - STAY VOICE BOT                    ===
-// ===                         VERSION 3.6                             ===
+// ===                PHIÊN BẢN 3.6 (Stable + Optimized)               ===
 // =======================================================================
 
-const { Client } = require('discord.js-selfbot-v13');
-const { joinVoiceChannel,entersState,VoiceConnectionStatus } = require('@discordjs/voice');
+const Discord = require('discord.js-selfbot-v13');
+const { joinVoiceChannel, entersState, VoiceConnectionStatus } = require('@discordjs/voice');
 const readline = require('readline');
 const fs = require('fs');
 const path = require('path');
-
+const chalk = require('chalk');
 const MAX_RECONNECT = 10;
 const DISCONNECTED_GRACE_MS = 5000;
 const READY_TIMEOUT_MS = 15000;
@@ -17,7 +17,68 @@ const STICKY_TARGET = true;
 const STICKY_DEBOUNCE_MS = 800;
 const STICKY_COOLDOWN_MS = 5000;
 
-const client = new Client({ checkUpdate: false });
+
+// =======================================================================
+// ===                         COLORS                                  ===
+// =======================================================================
+const log = {
+    info: (...args) => console.log(chalk.cyan.bold('[ℹ]'), ...args.map(a => chalk.cyan(a))),
+    success: (...args) => console.log(chalk.green.bold('[✓]'), ...args.map(a => chalk.green(a))),
+    warn: (...args) => console.log(chalk.yellow.bold('[!]'), ...args.map(a => chalk.yellow(a))),
+    error: (...args) => console.log(chalk.red.bold('[✕]'), ...args.map(a => chalk.red(a))),
+    event: (...args) => console.log(chalk.magenta.bold('[ᴇ]'), ...args.map(a => chalk.magenta(a))),
+    reconnect: (...args) => console.log(chalk.blue.bold('[↻]'), ...args.map(a => chalk.blue(a))),
+    sticky: (...args) => console.log(chalk.hex('#FF9900').bold('[📌]'), ...args.map(a => chalk.hex('#FF9900')(a))),
+    system: (...args) => console.log(chalk.gray(...args)),
+};
+
+
+class LimitedCollection extends Discord.Collection {
+    constructor(options = {}) {
+        super();
+        this.maxSize = options.maxSize === undefined ? Infinity : options.maxSize;
+    }
+
+    set(key, value) {
+        if (this.maxSize === 0) return this;
+        if (this.size >= this.maxSize && !this.has(key)) {
+            this.delete(this.keys().next().value);
+        }
+        return super.set(key, value);
+    }
+}
+
+const client = new Discord.Client({
+    checkUpdate: false,
+    
+    makeCache: (manager) => {
+        switch (manager.name) {
+            case 'GuildManager':
+            case 'ChannelManager':
+            case 'GuildChannelManager':
+            case 'RoleManager':
+            case 'PermissionOverwriteManager':
+            case 'GuildMemberManager':
+            case 'UserManager':
+                return new Discord.Collection();
+            case 'MessageManager':
+            case 'PresenceManager':
+            case 'GuildStickerManager':
+            case 'GuildEmojiManager':
+            case 'GuildScheduledEventManager':
+            case 'StageInstanceManager':
+            case 'ThreadManager':
+                return new LimitedCollection({ maxSize: 0 });
+            default:
+                return new LimitedCollection({ maxSize: 0 });
+        }
+    },
+
+    sweepers: {
+        threads: { interval: 3600, lifetime: 1800 },
+        messages: { interval: 3600, lifetime: 1800 }
+    }
+});
 
 let connection = null;
 let targetGuildId = null;
@@ -35,14 +96,12 @@ let lastStickyPullAt = 0;
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
-const q = (prompt) => new Promise((res) => rl.question(prompt, res));
 
-const log = (...a) => console.log(...a);
-const warn = (...a) => console.warn(...a);
-const err = (...a) => console.error(...a);
+const q = (prompt) => new Promise((res) => {
+    rl.question(chalk.greenBright(`   └── ${prompt}`), res);
+});
 
 
-/** Xóa bỏ mọi timer đang chờ kết nối lại. */
 function clearReconnect() {
   reconnecting = false;
   if (reconnectTimer) {
@@ -51,28 +110,25 @@ function clearReconnect() {
   }
 }
 
-/** Dừng vĩnh viễn việc kết nối lại và reset mục tiêu. */
+
 function stopReconnectPermanently(reason, note) {
   permanentBlockReason = reason;
   clearReconnect();
   targetGuildId = null;
   targetChannelId = null;
-  warn(`[✕] Dừng reconnect vĩnh viễn: ${reason}${note ? ' - ' + note : ''}`);
-  log('[ℹ] Dùng lệnh "join" để chọn kênh khác.');
+  log.warn(`Dừng reconnect vĩnh viễn: ${reason}${note ? ' - ' + note : ''}`);
+  log.info('Dùng lệnh "join" để chọn kênh khác');
 }
 
 
 function isVoiceLike(ch) {
   return (
-    //  discord.js v13
     ch?.type === 2 || ch?.type === 13 ||
-
-    // discord.js v14
     ch?.type === 'GUILD_VOICE' || ch?.type === 'GUILD_STAGE_VOICE' || 
-    
     ch?.isVoice?.() === true
   );
 }
+
 
 function canViewAndConnect(ch) {
   try {
@@ -85,30 +141,25 @@ function canViewAndConnect(ch) {
   }
 }
 
-/**
- * Cố gắng kết nối lại vào kênh thoại mục tiêu với độ trễ tăng dần.
- * @param {string} source Nguồn gọi hàm (để debug).
- */
 function attemptReconnect(source = 'unknown') {
   if (permanentBlockReason) {
-    log(`[↻] Bỏ qua reconnect (${source}) vì lỗi vĩnh viễn: ${permanentBlockReason}`);
+    log.info(`Bỏ qua reconnect (${source}) vì lỗi vĩnh viễn: ${permanentBlockReason}`);
     return;
   }
   if (!targetGuildId || !targetChannelId) return;
   if (reconnecting) return;
 
   if (reconnectAttempts >= MAX_RECONNECT) {
-    warn(`[!] Dừng thử kết nối sau ${MAX_RECONNECT} lần.`);
+    log.warn(`Dừng thử kết nối sau ${MAX_RECONNECT} lần`);
     return;
   }
 
   reconnecting = true;
-
   const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
   reconnectAttempts++;
   const myGen = ++reconnectGen;
 
-  log(`[↻] Thử kết nối lại lần ${reconnectAttempts}/${MAX_RECONNECT} sau ${Math.round(delay/1000)}s... (src=${source}, gen=${myGen})`);
+  log.reconnect(`Thử kết nối lại lần ${reconnectAttempts}/${MAX_RECONNECT} sau ${Math.round(delay/1000)}s... (src=${source}, gen=${myGen})`);
   
   if (reconnectTimer) clearTimeout(reconnectTimer);
 
@@ -128,11 +179,6 @@ function attemptReconnect(source = 'unknown') {
   }, delay);
 }
 
-/**
- * Hàm chính để tham gia hoặc chuyển kênh thoại.
- * @param {string} guildId
- * @param {string} channelId
- */
 async function joinVC(guildId, channelId) {
   try {
     const guild = client.guilds.cache.get(guildId);
@@ -154,7 +200,6 @@ async function joinVC(guildId, channelId) {
 
     clearReconnect();
     reconnectGen++;
-
   
     if (connection) {
       try {
@@ -164,7 +209,7 @@ async function joinVC(guildId, channelId) {
       connection = null;
     }
 
-    log(`[↻] Đang tham gia kênh: ${ch.name}...`);
+    log.reconnect(`Đang tham gia kênh: ${chalk.bold(ch.name)}...`);
     connection = joinVoiceChannel({
       channelId,
       guildId,
@@ -173,35 +218,29 @@ async function joinVC(guildId, channelId) {
       selfMute: true,
     });
 
-  
     await entersState(connection, VoiceConnectionStatus.Ready, READY_TIMEOUT_MS);
-    log(`[+] Đã tham gia thành công: ${ch.name} (${channelId})`);
+    log.success(`Đã tham gia thành công: ${chalk.bold(ch.name)}`, `(${channelId})`);
     
-  
     reconnectAttempts = 0;
     clearReconnect();
     lastReadyAt = Date.now();
-
   
     connection.on('stateChange', async (oldS, newS) => {
       if (newS.status === VoiceConnectionStatus.Disconnected) {
-      
         try {
           await Promise.race([
             entersState(connection, VoiceConnectionStatus.Signalling, DISCONNECTED_GRACE_MS),
             entersState(connection, VoiceConnectionStatus.Connecting, DISCONNECTED_GRACE_MS),
           ]);
         } catch {
-          warn('[!] Mất kết nối voice. Đang thử kết nối lại...');
+          log.warn('Mất kết nối voice. Đang thử kết nối lại...');
           attemptReconnect('stateChange');
         }
       } else if (newS.status === VoiceConnectionStatus.Destroyed) {
-      
         if (targetGuildId && targetChannelId && !permanentBlockReason) {
           attemptReconnect('destroyed');
         }
       } else if (newS.status === VoiceConnectionStatus.Ready) {
-      
         reconnectAttempts = 0;
         clearReconnect();
         lastReadyAt = Date.now();
@@ -209,17 +248,17 @@ async function joinVC(guildId, channelId) {
     });
 
     connection.on('error', (e) => {
-      err('[!] Voice connection error:', e.message);
+      log.error('Lỗi kết nối voice:', e.message);
       attemptReconnect('conn-error');
     });
 
   } catch (e) {
-    err(`[!] Lỗi khi tham gia voice: ${e.message}`);
+    log.error(`Lỗi khi tham gia voice: ${e.message}`);
     attemptReconnect('join-error');
   }
 }
 
-/** Rời khỏi kênh thoại và hủy mọi tiến trình reconnect. */
+
 function leaveVC() {
   stopReconnectPermanently('USER_COMMAND', 'Lệnh leave được gọi');
   if (connection) {
@@ -229,20 +268,19 @@ function leaveVC() {
     } catch {}
     connection = null;
   }
-  log('[✓] Đã rời voice channel');
+  log.success('Đã rời voice channel');
 }
 
 
 client.on('ready', () => {
-  console.log(`[✓] Đăng nhập thành công với tài khoản: ${client.user.tag}`);
-  console.log(`[✓] ID: ${client.user.id}`);
-  console.log('-----------------------------------------');
+    log.success(`Đăng nhập thành công với tài khoản:`, chalk.bold(client.user.tag));
+    log.success(`ID:`, chalk.bold(client.user.id));
+    log.system('----------------------------------------------------');
 });
 
 client.on('voiceStateUpdate', (oldState, newState) => {
   if (client.user?.id !== newState.id) return;
   if (Date.now() - lastReadyAt < 2000) return;
-
 
   if (
     STICKY_TARGET &&
@@ -251,7 +289,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
     newState.channelId && newState.channelId !== targetChannelId
   ) {
     if (Date.now() - lastStickyPullAt < STICKY_COOLDOWN_MS) {
-      log('[sticky] Đang trong thời gian cooldown, bỏ qua lần move này.');
+      log.sticky('Đang trong thời gian cooldown, bỏ qua lần move này');
       return;
     }
     if (stickyTimer) clearTimeout(stickyTimer);
@@ -263,7 +301,7 @@ client.on('voiceStateUpdate', (oldState, newState) => {
       const currentChannel = newState.guild?.members?.me?.voice?.channelId;
       if (currentChannel === targetChannelId) return;
 
-      warn(`[sticky] Bị di chuyển sang kênh "${newState.channel?.name || newState.channelId}". Đang kéo về...`);
+      log.sticky(`Bị di chuyển sang kênh "${chalk.bold(newState.channel?.name || newState.channelId)}". Đang kéo về...`);
       lastStickyPullAt = Date.now();
       joinVC(targetGuildId, targetChannelId);
     }, STICKY_DEBOUNCE_MS);
@@ -271,18 +309,17 @@ client.on('voiceStateUpdate', (oldState, newState) => {
 });
 
 
-
-/** Vòng lặp chính để nhận lệnh từ người dùng. */
 async function commandLoop() {
-  const cmd = (await q('\nNhập lệnh (join/leave/exit): ')).trim().toLowerCase();
+  const cmd = (await new Promise(res => rl.question(chalk.bold.white('\nNhập lệnh (join/leave/exit) > '), res))).trim().toLowerCase();
   switch (cmd) {
     case 'join': {
-      const guildId = (await q('   Nhập GUILD ID: ')).trim();
-      const channelId = (await q('   Nhập VOICE CHANNEL ID: ')).trim();
+      log.info('Nhập thông tin kênh để tham gia:');
+      const guildId = (await q('GUILD ID: ')).trim();
+      const channelId = (await q('VOICE CHANNEL ID: ')).trim();
       if (guildId && channelId) {
         await joinVC(guildId, channelId);
       } else {
-        warn('[!] GUILD ID và VOICE CHANNEL ID không được để trống.');
+        log.warn('GUILD ID và VOICE CHANNEL ID không được để trống');
       }
       break;
     }
@@ -290,16 +327,16 @@ async function commandLoop() {
       leaveVC();
       break;
     case 'exit':
-      log('[×] Đang thoát...');
+      log.info('Đang thoát...');
       cleanExit(0);
       return;
     default:
-      warn('[!] Lệnh không hợp lệ. Các lệnh có sẵn: join, leave, exit');
+      log.warn('Lệnh không hợp lệ. Các lệnh có sẵn:', chalk.bold('join, leave, exit'));
       break;
   }
 }
 
-/** Dọn dẹp tài nguyên và thoát ứng dụng một cách an toàn. */
+
 function cleanExit(code = 0) {
   try { rl.close(); } catch {}
   clearReconnect();
@@ -313,9 +350,10 @@ function cleanExit(code = 0) {
 
 process.on('SIGINT', () => {
   console.log();
-  warn('[×] Nhận tín hiệu SIGINT, đang thoát...');
+  log.warn('Nhận tín hiệu SIGINT, đang thoát...');
   cleanExit(0);
 });
+
 
 
 const CONFIG_PATH = path.join(process.cwd(), 'config.json');
@@ -327,7 +365,7 @@ function loadTokenFromFile() {
       return config.Token || null;
     }
   } catch (error) {
-    err('[!] Lỗi đọc file cấu hình:', error.message);
+    log.error('Lỗi đọc file cấu hình:', error.message);
   }
   return null;
 }
@@ -335,59 +373,56 @@ function loadTokenFromFile() {
 function saveTokenToFile(token) {
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify({ Token: token }, null, 2));
-    log(`[✓] Đã lưu token vào ${CONFIG_PATH}`);
+    log.success(`Đã lưu token vào ${chalk.bold(CONFIG_PATH)}`);
   } catch (error) {
-    err('[!] Không thể lưu token:', error.message);
+    log.error('Không thể lưu token:', error.message);
   }
 }
 
-/**
- * Hàm chính của chương trình (Main Function).
- * Chịu trách nhiệm cho luồng thực thi chính: đăng nhập và bắt đầu vòng lặp lệnh.
- */
+
 async function main() {
-  log('-----------------------------------------');
-  log('      Horimeki - Stay Voice Bot v3.6     ');
-  log('-----------------------------------------');
+  // Banner mới
+  console.log(chalk.cyan('╭───────────────────────────────────────────────────╮'));
+  console.log(chalk.cyan('│') + chalk.bold.magenta('            Horimeki - Stay Voice Bot v3.6         ') + chalk.cyan('│'));
+  console.log(chalk.cyan('│') + chalk.white('               (Stable & Optimized)                ') + chalk.cyan('│'));
+  console.log(chalk.cyan('╰───────────────────────────────────────────────────╯'));
+
 
   let tokenToLogin = null;
   const savedToken = loadTokenFromFile();
 
   if (savedToken) {
-    const answer = await q('Phát hiện token đã lưu. Bạn có muốn sử dụng? (y/n): ');
+    const answer = await new Promise(res => rl.question(chalk.yellow.bold('[?] ') + chalk.yellow('Phát hiện token đã lưu. Bạn có muốn sử dụng? (y/n): '), res));
     if (answer.toLowerCase() === 'y') {
       tokenToLogin = savedToken;
     }
   }
   
-
   while (!client.token) {
     try {
       if (!tokenToLogin) {
-        tokenToLogin = await q('\nNhập token Discord của bạn: ');
+        tokenToLogin = await new Promise(res => rl.question(chalk.yellow.bold('\n[?] ') + chalk.yellow('Nhập token Discord của bạn: '), res));
         if (!tokenToLogin) {
-          warn('[!] Token không được để trống!');
+          log.warn('Token không được để trống!');
           continue;
         }
       }
-      log('[↻] Đang đăng nhập...');
+      log.reconnect('Đang đăng nhập...');
       await client.login(tokenToLogin);
     } catch (e) {
-      err(`[!] Lỗi đăng nhập: ${e.message}`);
-      warn('[!] Vui lòng kiểm tra lại token.');
+      log.error(`Lỗi đăng nhập: ${e.message}`);
+      log.warn('Vui lòng kiểm tra lại token');
       tokenToLogin = null;
     }
   }
 
-
   if (!savedToken || savedToken !== client.token) {
-      const saveAnswer = await q('Bạn có muốn lưu token này để sử dụng lần sau? (y/n): ');
+      const saveAnswer = await new Promise(res => rl.question(chalk.yellow.bold('[?] ') + chalk.yellow('Bạn có muốn lưu token này để sử dụng lần sau? (y/n): '), res));
       if (saveAnswer.toLowerCase() === 'y') {
           saveTokenToFile(client.token);
       }
   }
   
-
   while (true) {
     await commandLoop();
   }
